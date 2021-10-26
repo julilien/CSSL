@@ -2,7 +2,7 @@
 
 This repository is the official implementation of [Credal Self-Supervised Learning](https://arxiv.org/abs/2106.11853) by Julian Lienen and Eyke Hüllermeier (to appear at NeurIPS 2021). 
 
-![Overview of CSSL for image classification](CSSL_Overview.svg)
+![Overview of CSSL for image classification](CSSL_Overview.png)
 
 Please cite this work as follows:
 
