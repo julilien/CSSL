@@ -30,9 +30,9 @@ from absl import flags
 from tqdm import trange
 
 from cta.cta_remixmatch import CTAReMixMatch
-from libml import data, utils, augment, ctaugment, layers
 
-from libml.utils import EasyDict
+from cssl import CSSL
+from libml import data, utils, augment, ctaugment, layers
 
 FLAGS = flags.FLAGS
 
@@ -94,16 +94,7 @@ class FixMatchDA(CTAReMixMatch):
             while self.tmp.print_queue:
                 print(self.tmp.print_queue.pop(0))
 
-    def guess_label(self, p_model_y, p_data, p_model, **kwargs):
-        del kwargs
-        # Compute the target distribution.
-        p_ratio = (1e-6 + p_data) / (1e-6 + p_model)
-        p_target = p_model_y * p_ratio
-        p_target /= tf.reduce_sum(p_target, axis=1, keep_dims=True)
-
-        return EasyDict(p_target=p_target, p_model=p_model_y)
-
-    def model(self, batch, lr, wd, wu, confidence, uratio, ema=0.999, dbuf=128,**kwargs):
+    def model(self, batch, lr, wd, wu, confidence, uratio, ema=0.999, dbuf=128, **kwargs):
         hwc = [self.dataset.height, self.dataset.width, self.dataset.colors]
         xt_in = tf.placeholder(tf.float32, [batch] + hwc, 'xt')  # Training labeled
         x_in = tf.placeholder(tf.float32, [None] + hwc, 'x')  # Eval images
@@ -120,7 +111,7 @@ class FixMatchDA(CTAReMixMatch):
         x = utils.interleave(tf.concat([xt_in, y_in[:, 0], y_in[:, 1]], 0), 2 * uratio + 1)
 
         logits = utils.para_cat(lambda x: classifier(x, training=True), x)
-        logits = utils.de_interleave(logits, 2 * uratio+1)
+        logits = utils.de_interleave(logits, 2 * uratio + 1)
 
         post_ops = [v for v in tf.get_collection(tf.GraphKeys.UPDATE_OPS) if v not in skip_ops]
         logits_x = logits[:batch]
@@ -137,8 +128,9 @@ class FixMatchDA(CTAReMixMatch):
         p_target = layers.PMovingAverage('p_target', self.nclass, dbuf)
         p_data = layers.PData(self.dataset)
 
+        # Construct pseudo-labels using distribution alignment
         pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
-        guess = self.guess_label(pseudo_labels, p_data(), p_model())
+        guess = CSSL.guess_label(pseudo_labels, p_data(), p_model())
         guess_p_target = tf.stop_gradient(guess.p_target)
 
         loss_xeu = tf.nn.softmax_cross_entropy_with_logits_v2(labels=guess_p_target, logits=logits_strong)

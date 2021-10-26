@@ -27,14 +27,12 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 from absl import app
 from absl import flags
-from tqdm import trange
 
 from cta.cta_remixmatch import CTAReMixMatch
-from libml import data, utils, augment, ctaugment, layers
 
-from tensorflow.python.keras.losses import kullback_leibler_divergence
-
-from libml.utils import EasyDict
+from cssl import CSSL
+from libml import data, utils, augment, ctaugment
+from libml.models import MultiModel
 
 FLAGS = flags.FLAGS
 
@@ -54,59 +52,13 @@ class AugmentPoolCTACutOut(augment.AugmentPoolCTA):
         return dict(image=np.stack([x[0]] + [ctaugment.apply(y, cutout_policy()) for y in x[1:]]).astype('f'))
 
 
-class CSSLAlphaBound(CTAReMixMatch):
+class UPSMatch(CTAReMixMatch):
     AUGMENT_POOL_CLASS = AugmentPoolCTACutOut
 
     def train(self, train_nimg, report_nimg):
-        if FLAGS.eval_ckpt:
-            self.eval_checkpoint(None)
-            return
+        CSSL.cssl_train(self, train_nimg, report_nimg)
 
-        batch = FLAGS.batch
-        train_labeled = self.dataset.train_labeled.repeat().shuffle(FLAGS.shuffle).parse().augment()
-        train_labeled = train_labeled.batch(batch).prefetch(
-            tf.data.experimental.AUTOTUNE).make_one_shot_iterator().get_next()
-        train_unlabeled = self.dataset.train_unlabeled.repeat().shuffle(FLAGS.shuffle).parse().augment()
-        train_unlabeled = train_unlabeled.batch(batch * self.params['uratio']).prefetch(tf.data.experimental.AUTOTUNE)
-        train_unlabeled = train_unlabeled.make_one_shot_iterator().get_next()
-        scaffold = tf.train.Scaffold(saver=tf.train.Saver(max_to_keep=FLAGS.keep_ckpt,
-                                                          pad_step_number=10))
-
-        with tf.Session(config=utils.get_config()) as sess:
-            self.session = sess
-            self.cache_eval()
-
-        with tf.train.MonitoredTrainingSession(
-                scaffold=scaffold,
-                checkpoint_dir=self.checkpoint_dir,
-                config=utils.get_config(),
-                save_checkpoint_steps=FLAGS.save_kimg << 10,
-                save_summaries_steps=report_nimg - batch) as train_session:
-            self.session = train_session._tf_sess()
-            gen_labeled = self.gen_labeled_fn(train_labeled)
-            gen_unlabeled = self.gen_unlabeled_fn(train_unlabeled)
-            self.tmp.step = self.session.run(self.step)
-            while self.tmp.step < train_nimg:
-                loop = trange(self.tmp.step % report_nimg, report_nimg, batch,
-                              leave=False, unit='img', unit_scale=batch,
-                              desc='Epoch %d/%d' % (1 + (self.tmp.step // report_nimg), train_nimg // report_nimg))
-                for _ in loop:
-                    self.train_step(train_session, gen_labeled, gen_unlabeled)
-                    while self.tmp.print_queue:
-                        loop.write(self.tmp.print_queue.pop(0))
-            while self.tmp.print_queue:
-                print(self.tmp.print_queue.pop(0))
-
-    def guess_label(self, p_model_y, p_data, p_model, **kwargs):
-        del kwargs
-        # Compute the target distribution.
-        p_ratio = (1e-6 + p_data) / (1e-6 + p_model)
-        p_target = p_model_y * p_ratio
-        p_target /= tf.reduce_sum(p_target, axis=1, keep_dims=True)
-
-        return EasyDict(p_target=p_target, p_model=p_model_y)
-
-    def model(self, batch, lr, wd, wu, confidence, alpha_bound, uratio, ema=0.999, dbuf=128, **kwargs):
+    def model(self, batch, lr, wd, wu, conf_p, uncertainty_p, uratio, ema=0.999, **kwargs):
         hwc = [self.dataset.height, self.dataset.width, self.dataset.colors]
         xt_in = tf.placeholder(tf.float32, [batch] + hwc, 'xt')  # Training labeled
         x_in = tf.placeholder(tf.float32, [None] + hwc, 'x')  # Eval images
@@ -134,42 +86,41 @@ class CSSLAlphaBound(CTAReMixMatch):
         tf.summary.scalar('losses/xe', loss_xe)
 
         # Pseudo-label cross entropy for unlabeled data
-        orig_pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
-        pseudo_labels = tf.one_hot(tf.argmax(orig_pseudo_labels, axis=1), depth=tf.shape(orig_pseudo_labels)[1])
+        pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
 
-        ## Calculate alpha
-        # Moving average of the current estimated label distribution
-        p_model = layers.PMovingAverage('p_model', self.nclass, dbuf)
-        p_target = layers.PMovingAverage('p_target', self.nclass, dbuf)  # Rectified distribution (only for plotting)
-        # Known (or inferred) true unlabeled distribution
-        p_data = layers.PData(self.dataset)
-        p_data_tf = p_data()
-        p_model_tf = p_model()
-        guess = self.guess_label(orig_pseudo_labels, p_data_tf, p_model_tf)
+        classifier_do = lambda x, **kw: self.classifier(x, **kw, **kwargs).logits
 
-        guess_p_target = tf.stop_gradient(guess.p_target)
+        # Perform MCDropout uncertainty quantification
+        inner_logits = utils.para_cat(lambda x: classifier_do(x, prob=0.7, training=False), x)
+        inner_logits = utils.de_interleave(inner_logits, 2 * uratio + 1)
+        inner_logits_weak, _ = tf.split(inner_logits[batch:], 2)
+        del inner_logits
 
-        max_prob = tf.math.reduce_max(guess_p_target, axis=-1)
-        relax_alpha = tf.ones_like(max_prob) - max_prob
-        relax_alpha = tf.clip_by_value(relax_alpha, alpha_bound, 1.)
-        tf.summary.scalar('monitors/alpha', tf.reduce_mean(relax_alpha))
+        raw_predictions = []
+        for _ in range(8):
+            inner_logits = utils.para_cat(lambda x: classifier_do(x, prob=0.7, training=False), x)
+            inner_logits = utils.de_interleave(inner_logits, 2 * uratio + 1)
+            inner_logits_weak, _ = tf.split(inner_logits[batch:], 2)
+            del inner_logits
 
-        pred_softmax = tf.nn.softmax(logits_strong)
-        sum_y_hat_prime = tf.reduce_sum((1. - pseudo_labels) * pred_softmax, axis=-1)
-        y_pred_hat = tf.expand_dims(relax_alpha, axis=-1) * pred_softmax / (
-                    tf.expand_dims(sum_y_hat_prime, axis=-1) + 1e-7)
-        y_true_credal = tf.where(tf.greater(pseudo_labels, 0.1),
-                                 tf.ones_like(pseudo_labels) - tf.expand_dims(relax_alpha, axis=-1), y_pred_hat)
-        divergence = kullback_leibler_divergence(y_true_credal, pred_softmax)
-        preds = tf.reduce_sum(pred_softmax * pseudo_labels, axis=-1)
-        loss_xeu = tf.where(tf.greater_equal(preds, 1. - relax_alpha), tf.zeros_like(divergence),
-                            divergence)
+            raw_predictions.append(tf.expand_dims(tf.stop_gradient(tf.nn.softmax(inner_logits_weak)), axis=0))
 
-        pseudo_mask = tf.to_float(tf.reduce_max(orig_pseudo_labels, axis=1) >= confidence)
+        output_probs = tf.concat(raw_predictions, axis=0)
+        output_probs_std = tf.math.reduce_std(output_probs, axis=0)
+        output_probs_mean = tf.reduce_mean(output_probs, axis=0)
+        output_probs_argmax = tf.math.argmax(output_probs_mean, axis=-1)
+        uncertainty = tf.gather(output_probs_std, output_probs_argmax, axis=1, batch_dims=1)
+
+        # Calculate the unlabeled loss
+        loss_xeu = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.argmax(pseudo_labels, axis=1),
+                                                                  logits=logits_strong)
+        # Mask out instances that to not meet the confidence or uncertainty threshold
+        pseudo_mask = tf.to_float(tf.logical_and(tf.reduce_max(pseudo_labels, axis=1) >= conf_p,
+                                                 uncertainty <= uncertainty_p))
+
         tf.summary.scalar('monitors/mask', tf.reduce_mean(pseudo_mask))
         loss_xeu = tf.reduce_mean(loss_xeu * pseudo_mask)
         tf.summary.scalar('losses/xeu', loss_xeu)
-        self.distribution_summary(p_data(), p_model(), p_target())
 
         # L2 regularization
         loss_wd = sum(tf.nn.l2_loss(v) for v in utils.model_vars('classify') if 'kernel' in v.name)
@@ -178,9 +129,7 @@ class CSSLAlphaBound(CTAReMixMatch):
         ema = tf.train.ExponentialMovingAverage(decay=ema)
         ema_op = ema.apply(utils.model_vars())
         ema_getter = functools.partial(utils.getter_ema, ema)
-        post_ops.extend([ema_op,
-                         p_model.update(guess.p_model),
-                         p_target.update(guess.p_target)])
+        post_ops.append(ema_op)
 
         train_op = tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True).minimize(
             loss_xe + wu * loss_xeu + wd * loss_wd, colocate_gradients_with_ops=True)
@@ -198,29 +147,28 @@ def main(argv):
     del argv
     dataset = data.PAIR_DATASETS()[FLAGS.dataset]()
     log_width = utils.ilog2(dataset.width)
-    model = CSSLAlphaBound(
-        os.path.join(FLAGS.train_dir, dataset.name, CSSLAlphaBound.cta_name()),
+    model = UPSMatch(
+        os.path.join(FLAGS.train_dir, dataset.name, UPSMatch.cta_name()),
         dataset,
         lr=FLAGS.lr,
         wd=FLAGS.wd,
-        arch=FLAGS.arch,
+        arch=MultiModel.MODEL_MCDROPRESNET,
         batch=FLAGS.batch,
         nclass=dataset.nclass,
         wu=FLAGS.wu,
-        confidence=FLAGS.confidence,
-        alpha_bound=FLAGS.alpha_bound,
+        conf_p=FLAGS.conf_p,
+        uncertainty_p=FLAGS.uncertainty_p,
         uratio=FLAGS.uratio,
         scales=FLAGS.scales or (log_width - 2),
         filters=FLAGS.filters,
         repeat=FLAGS.repeat)
-
     model.train(FLAGS.train_kimg << 10, FLAGS.report_kimg << 10)
 
 
 if __name__ == '__main__':
     utils.setup_tf()
-    flags.DEFINE_float('confidence', 0.0, 'Confidence threshold.')
-    flags.DEFINE_float('alpha_bound', 0.03, 'Lower bound for alpha values.')
+    flags.DEFINE_float('conf_p', 0.7, 'Confidence threshold (lower bound).')
+    flags.DEFINE_float('uncertainty_p', 0.05, 'Positive uncertainty threshold (upper bound).')
     flags.DEFINE_float('wd', 0.0005, 'Weight decay.')
     flags.DEFINE_float('wu', 1, 'Pseudo label loss weight.')
     flags.DEFINE_integer('filters', 32, 'Filter size of convolutions.')

@@ -1,29 +1,15 @@
-### Extension note: ###
-#
-# Code follows the implementation of FixMatch and co. from the origin repository and replaces necessary parts to
-# implement the new baseline as described in our paper.
-#
-### Copyright note from original code: ###
-#
-# Copyright 2019 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-###
-
 import numpy as np
 
 
 def calculate_ece(predicted, labels, num_bins=15):
+    """
+    Calculates the expected calibration error (ECE) for the provided number of bins.
+
+    :param predicted: Probabilistic predictions
+    :param labels: Hard labels (classes)
+    :param num_bins: Number of bins for the ECE discretization
+    :return: Returns the numeric ECE score
+    """
     predicted_cls = predicted.argmax(1)
 
     interval_step = 1. / num_bins

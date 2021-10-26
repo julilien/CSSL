@@ -27,16 +27,13 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 from absl import app
 from absl import flags
-from tqdm import trange
 
 from cta.cta_remixmatch import CTAReMixMatch
+
+from cssl import CSSL
 from libml import data, utils, augment, ctaugment, layers
 
-from tensorflow.python.keras.losses import kullback_leibler_divergence
 from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.losses import categorical_crossentropy
-
-from libml.utils import EasyDict
 
 FLAGS = flags.FLAGS
 
@@ -57,56 +54,13 @@ class AugmentPoolCTACutOut(augment.AugmentPoolCTA):
 
 
 class LabelSmoothingMatch(CTAReMixMatch):
+    """
+    FixMatch variant using (adaptive) label smoothing as described in A.2 in the paper's appendix.
+    """
     AUGMENT_POOL_CLASS = AugmentPoolCTACutOut
 
     def train(self, train_nimg, report_nimg):
-        if FLAGS.eval_ckpt:
-            self.eval_checkpoint(None)
-            return
-
-        batch = FLAGS.batch
-        train_labeled = self.dataset.train_labeled.repeat().shuffle(FLAGS.shuffle).parse().augment()
-        train_labeled = train_labeled.batch(batch).prefetch(
-            tf.data.experimental.AUTOTUNE).make_one_shot_iterator().get_next()
-        train_unlabeled = self.dataset.train_unlabeled.repeat().shuffle(FLAGS.shuffle).parse().augment()
-        train_unlabeled = train_unlabeled.batch(batch * self.params['uratio']).prefetch(tf.data.experimental.AUTOTUNE)
-        train_unlabeled = train_unlabeled.make_one_shot_iterator().get_next()
-        scaffold = tf.train.Scaffold(saver=tf.train.Saver(max_to_keep=FLAGS.keep_ckpt,
-                                                          pad_step_number=10))
-
-        with tf.Session(config=utils.get_config()) as sess:
-            self.session = sess
-            self.cache_eval()
-
-        with tf.train.MonitoredTrainingSession(
-                scaffold=scaffold,
-                checkpoint_dir=self.checkpoint_dir,
-                config=utils.get_config(),
-                save_checkpoint_steps=FLAGS.save_kimg << 10,
-                save_summaries_steps=report_nimg - batch) as train_session:
-            self.session = train_session._tf_sess()
-            gen_labeled = self.gen_labeled_fn(train_labeled)
-            gen_unlabeled = self.gen_unlabeled_fn(train_unlabeled)
-            self.tmp.step = self.session.run(self.step)
-            while self.tmp.step < train_nimg:
-                loop = trange(self.tmp.step % report_nimg, report_nimg, batch,
-                              leave=False, unit='img', unit_scale=batch,
-                              desc='Epoch %d/%d' % (1 + (self.tmp.step // report_nimg), train_nimg // report_nimg))
-                for _ in loop:
-                    self.train_step(train_session, gen_labeled, gen_unlabeled)
-                    while self.tmp.print_queue:
-                        loop.write(self.tmp.print_queue.pop(0))
-            while self.tmp.print_queue:
-                print(self.tmp.print_queue.pop(0))
-
-    def guess_label(self, p_model_y, p_data, p_model, **kwargs):
-        del kwargs
-        # Compute the target distribution.
-        p_ratio = (1e-6 + p_data) / (1e-6 + p_model)
-        p_target = p_model_y * p_ratio
-        p_target /= tf.reduce_sum(p_target, axis=1, keep_dims=True)
-
-        return EasyDict(p_target=p_target, p_model=p_model_y)
+        CSSL.cssl_train(self, train_nimg, report_nimg)
 
     def model(self, batch, lr, wd, wu, confidence, uratio, ema=0.999, dbuf=128, **kwargs):
         hwc = [self.dataset.height, self.dataset.width, self.dataset.colors]
@@ -135,34 +89,34 @@ class LabelSmoothingMatch(CTAReMixMatch):
         loss_xe = tf.reduce_mean(loss_xe)
         tf.summary.scalar('losses/xe', loss_xe)
 
-        # Pseudo-label cross entropy for unlabeled data
+        # Pseudo-label generation: Similar to CSSL, determine reference class and smoothing parameter alpha
         orig_pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
         pseudo_labels = tf.one_hot(tf.argmax(orig_pseudo_labels, axis=1), depth=tf.shape(orig_pseudo_labels)[1])
 
-        ## Calculate alpha
-        # Moving average of the current estimated label distribution
+        # Maintain alignment moving averages
         p_model = layers.PMovingAverage('p_model', self.nclass, dbuf)
         p_target = layers.PMovingAverage('p_target', self.nclass, dbuf)  # Rectified distribution (only for plotting)
-        # Known (or inferred) true unlabeled distribution
         p_data = layers.PData(self.dataset)
         p_data_tf = p_data()
         p_model_tf = p_model()
 
-        guess = self.guess_label(orig_pseudo_labels, p_data_tf, p_model_tf)
-        guess_p_target = guess.p_target
+        guess = CSSL.guess_label(orig_pseudo_labels, p_data_tf, p_model_tf)
 
+        # Determine smoothing parameter alpha
+        guess_p_target = guess.p_target
         max_prob = tf.math.reduce_max(guess_p_target, axis=-1)
         alpha = tf.ones_like(max_prob) - max_prob
         tf.summary.scalar('monitors/alpha', tf.reduce_mean(alpha))
 
+        # Construct smooth targets
         pred_softmax = tf.nn.softmax(logits_strong)
-
         num_classes = tf.to_float(tf.shape(pseudo_labels)[-1])
         alpha = tf.expand_dims(alpha, axis=-1)
         smoothed_pseudo_labels = pseudo_labels * (1.0 - alpha) + (alpha / num_classes)
 
+        # Calculate label smoothing loss
         loss_xeu = K.categorical_crossentropy(smoothed_pseudo_labels, pred_softmax)
-
+        # Optionally, filter out instances by confidence
         pseudo_mask = tf.to_float(tf.reduce_max(orig_pseudo_labels, axis=1) >= confidence)
         tf.summary.scalar('monitors/mask', tf.reduce_mean(pseudo_mask))
         loss_xeu = tf.reduce_mean(loss_xeu * pseudo_mask)
@@ -173,6 +127,7 @@ class LabelSmoothingMatch(CTAReMixMatch):
         loss_wd = sum(tf.nn.l2_loss(v) for v in utils.model_vars('classify') if 'kernel' in v.name)
         tf.summary.scalar('losses/wd', loss_wd)
 
+        # Apply EMA
         ema = tf.train.ExponentialMovingAverage(decay=ema)
         ema_op = ema.apply(utils.model_vars())
         ema_getter = functools.partial(utils.getter_ema, ema)
