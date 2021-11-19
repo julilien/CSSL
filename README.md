@@ -10,7 +10,7 @@ Please cite this work as follows:
 @InProceedings{Lienen2021_CSSL,
     author    = {Lienen, Julian and H\"ullermeier, Eyke},
     title     = {Credal Self-Supervised Learning},
-    booktitle = {Advances in Neural Information Processing Systems 35: Annual Conference on Neural Information Processing Systems, {NeurIPS}, December 6-14, 2021, virtual},
+    booktitle = {Advances in Neural Information Processing Systems 34: Annual Conference on Neural Information Processing Systems, {NeurIPS}, December 6-14, 2021, virtual},
     year      = {2021}
 }
 ```
